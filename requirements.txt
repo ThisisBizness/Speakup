@@ -2,4 +2,5 @@ fastapi
 uvicorn[standard]
 google-generativeai
 python-dotenv
-Jinja2 
+Jinja2
+python-multipart 
