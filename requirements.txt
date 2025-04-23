@@ -3,4 +3,7 @@ uvicorn[standard]
 google-generativeai
 python-dotenv
 Jinja2
-python-multipart 
+python-multipart
+@vercel/kv
+@vercel/blob
+requests 

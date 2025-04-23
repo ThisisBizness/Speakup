@@ -868,6 +868,7 @@
             </form>
             
             <div id="spinner"></div>
+            <div id="status-message" style="display: none; margin-top: 1rem; padding: 0.75rem 1rem; background-color: var(--primary-light); color: var(--primary-dark); border-radius: var(--radius); text-align: center; font-weight: 500;"></div>
             <div id="error-message" class="error" style="display: none;" aria-live="polite"></div>
         </div>
 
@@ -912,7 +913,7 @@
         const resultsDiv = document.getElementById('results');
         const resultContent = document.getElementById('result-content');
         const rawResultPre = document.getElementById('raw-result');
-        const spinner = document.getElementById('spinner');
+        const statusMessageDiv = document.getElementById('status-message');
         const errorMessageDiv = document.getElementById('error-message');
         const fileInput = document.getElementById('video-file');
         const fileLabel = document.getElementById('file-label');
@@ -925,21 +926,24 @@
         const chatContainer = document.getElementById('chat-container');
         
         let currentSessionId = getCookie('session_id');
-        let currentAnalysisId = '';
+        let currentJobId = null;
+        let pollingIntervalId = null;
+        let pollTimeoutId = null;
         
-        // --- Event Listeners ---
+        const POLLING_INTERVAL_MS = 5000;
+        const POLLING_TIMEOUT_MS = 300000;
+        
         fileInput.addEventListener('change', handleFileSelection);
         uploadForm.addEventListener('submit', handleUploadSubmit);
         questionForm.addEventListener('submit', handleQuestionSubmit);
 
-        // --- UI Update Functions ---
         function showLoading(button, text = 'Processing...') {
             button.disabled = true;
             button.classList.add('loading');
             const buttonText = button.querySelector('.button-text');
-            const buttonIcon = button.querySelector('.button-icon');
+            const buttonIconContainer = button.querySelector('.button-icon');
             if (buttonText) buttonText.textContent = text;
-            if (buttonIcon) buttonIcon.innerHTML = `
+            if (buttonIconContainer) buttonIconContainer.innerHTML = `
                 <svg class="animate-spin" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
                    <path stroke="none" d="M0 0h24v24H0z" fill="none"></path>
                    <path d="M12 3a9 9 0 1 0 9 9"></path>
@@ -950,26 +954,38 @@
             button.disabled = false;
             button.classList.remove('loading');
             const buttonText = button.querySelector('.button-text');
-            const buttonIcon = button.querySelector('.button-icon');
+            const buttonIconContainer = button.querySelector('.button-icon');
             if (buttonText) buttonText.textContent = originalText;
-            if (buttonIcon) buttonIcon.innerHTML = originalIconHTML;
+            if (buttonIconContainer) buttonIconContainer.innerHTML = originalIconHTML;
         }
 
-        function displayError(message) {
+        function displayError(message, isUploadError = false) {
             errorMessageDiv.innerHTML = `
                 <div class="error-title">
                     <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line>
                     </svg>
-                    <span>Error</span>
+                    <span>${isUploadError ? 'Upload Error' : 'Error'}</span>
                 </div>
-                <div>${message}</div>
+                <div>${escapeHtml(message)}</div>
             `;
             errorMessageDiv.style.display = 'flex';
-            spinner.style.display = 'none';
+            hideStatusMessage();
+        }
+        
+        function showStatusMessage(message) {
+            statusMessageDiv.textContent = message;
+            statusMessageDiv.style.display = 'block';
+            errorMessageDiv.style.display = 'none';
+        }
+        
+        function hideStatusMessage() {
+            statusMessageDiv.style.display = 'none';
+            statusMessageDiv.textContent = '';
         }
 
-        function resetUI() {
+        function resetUI(clearFile = true) {
+            hideStatusMessage();
             errorMessageDiv.style.display = 'none';
             errorMessageDiv.textContent = '';
             resultsDiv.style.display = 'none';
@@ -977,21 +993,35 @@
             resultContent.innerHTML = '';
             rawResultPre.textContent = '';
             chatContainer.innerHTML = '';
-            spinner.style.display = 'none';
-            hideLoading(analyzeButton, 'Analyze My Speaking', analyzeButton.querySelector('.button-icon').innerHTML); // Reset button state
+            if (clearFile) {
+                resetFileInput();
+            }
+            if (analyzeButton.classList.contains('loading')) {
+                 hideLoading(analyzeButton, 'Analyze My Speaking', getOriginalIconHTML(analyzeButton));
+            }
+             if (askButton.classList.contains('loading')) {
+                 hideLoading(askButton, 'Ask Question', getOriginalIconHTML(askButton));
+            }
+        }
+        
+        function getOriginalIconHTML(button) {
+             if (button.id === 'analyze-button') {
+                 return `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>`;
+             } else if (button.id === 'ask-button') {
+                 return `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>`;
+             }
+             return '';
         }
 
-        // --- Event Handlers ---
         function handleFileSelection() {
+             resetUI(false);
             if (this.files.length > 0) {
                 const file = this.files[0];
                 fileName.textContent = file.name;
                 fileLabel.classList.add('has-file');
-                errorMessageDiv.style.display = 'none'; // Clear previous errors
 
-                // Validate file type
                 if (!file.type.startsWith('video/')) {
-                    displayError('Invalid file type. Please select a video file (e.g., MP4, MOV, WEBM).');
+                    displayError('Invalid file type. Please select a video file (e.g., MP4, MOV, WEBM).', true);
                     resetFileInput();
                     return;
                 }
@@ -1008,66 +1038,174 @@
 
         async function handleUploadSubmit(event) {
             event.preventDefault();
-            resetUI(); // Clear previous results and errors
+            resetUI(false);
             
             if (fileInput.files.length === 0) {
-                displayError('Please select a video file first.');
+                displayError('Please select a video file first.', true);
                 return;
             }
+            const file = fileInput.files[0];
 
             const originalButtonText = analyzeButton.querySelector('.button-text').textContent;
-            const originalButtonIcon = analyzeButton.querySelector('.button-icon').innerHTML;
-            showLoading(analyzeButton, 'Analyzing...');
-            spinner.style.display = 'block'; // Use dedicated spinner
-
-            const formData = new FormData();
-            formData.append('video', fileInput.files[0]);
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort('Request timed out after 5 minutes.'), 300000);
+            const originalButtonIcon = getOriginalIconHTML(analyzeButton);
+            showLoading(analyzeButton, 'Uploading...');
+            showStatusMessage('Requesting upload permission...');
 
             try {
-                const response = await fetch('/analyze', {
+                const tokenResponse = await fetch('/api/upload-token', {
                     method: 'POST',
-                    body: formData,
-                    signal: controller.signal
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filename: file.name })
+                });
+
+                if (!tokenResponse.ok) {
+                    const errorData = await tokenResponse.json();
+                    throw new Error(errorData.detail || 'Failed to get upload token.');
+                }
+                const uploadTokenData = await tokenResponse.json();
+                const { url: blobPutUrl, downloadUrl: finalBlobUrl, pathname } = uploadTokenData;
+                
+                showStatusMessage(`Uploading video to secure storage (0%)...`);
+
+                const uploadResponse = await fetch(blobPutUrl, {
+                    method: 'PUT',
+                    body: file,
+                    headers: {
+                        'Content-Type': file.type,
+                        ...uploadTokenData.headers
+                    }
                 });
                 
-                clearTimeout(timeoutId);
-                spinner.style.display = 'none';
-                
-                const result = await response.json();
-                rawResultPre.textContent = JSON.stringify(result, null, 2);
+                if (!uploadResponse.ok) {
+                    let blobErrorDetail = `Blob storage upload failed with status: ${uploadResponse.status}`;
+                     try {
+                         const errorXml = await uploadResponse.text();
+                         const codeMatch = errorXml.match(/<code>(.*?)<\/code>/i);
+                         const messageMatch = errorXml.match(/<message>(.*?)<\/message>/i);
+                         if (codeMatch && messageMatch) {
+                             blobErrorDetail = `Blob Upload Error (${codeMatch[1]}): ${messageMatch[1]}`;
+                         } else if (errorXml.length < 200) {
+                             blobErrorDetail += ": " + errorXml;
+                         }
+                     } catch (_) { /* Ignore if reading error body fails */ }
+                    throw new Error(blobErrorDetail);
+                }
 
-                if (!response.ok) {
-                    throw new Error(result.error || `Analysis failed (Status: ${response.status})`);
+                showStatusMessage('Upload complete! Starting analysis...');
+                
+                const startAnalysisResponse = await fetch('/api/start-analysis', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        blob_url: finalBlobUrl,
+                        filename: file.name,
+                        content_type: file.type
+                    })
+                });
+
+                if (!startAnalysisResponse.ok) {
+                     const errorData = await startAnalysisResponse.json();
+                    throw new Error(errorData.detail || 'Failed to start analysis job.');
                 }
                 
-                currentSessionId = result.session_id || currentSessionId;
-                currentAnalysisId = result.analysis_id || '';
+                const jobData = await startAnalysisResponse.json();
+                currentJobId = jobData.job_id;
+                showStatusMessage(`Analysis queued (Job ID: ${currentJobId}). Waiting for results...`);
+                hideLoading(analyzeButton, originalButtonText, originalButtonIcon);
 
-                displayResults(result);
-                resultsDiv.style.display = 'block';
-                if (!result.error) { // Only show follow-up if no error in result
-                     followUpSection.style.display = 'block';
-                     questionInput.focus(); // Focus input for convenience
-                }
-                resultsDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                resetFileInput();
+                startPolling(currentJobId);
 
             } catch (error) {
-                console.error('Error during analysis:', error);
-                displayError(error.message || 'An unexpected error occurred during analysis.');
-            } finally {
+                console.error('Error during upload/start analysis:', error);
+                displayError(error.message || 'An unexpected error occurred.', true);
                 hideLoading(analyzeButton, originalButtonText, originalButtonIcon);
-                spinner.style.display = 'none';
+                resetFileInput();
             }
+        }
+        
+        function startPolling(jobId) {
+            if (pollingIntervalId) clearInterval(pollingIntervalId);
+            if (pollTimeoutId) clearTimeout(pollTimeoutId);
+
+            const startTime = Date.now();
+
+            pollingIntervalId = setInterval(async () => {
+                try {
+                    const statusResponse = await fetch(`/api/analysis-status/${jobId}`);
+                    if (!statusResponse.ok) {
+                        if (statusResponse.status === 404) {
+                             displayError(`Analysis job ${jobId} not found. Please try again.`);
+                        } else {
+                             const errorData = await statusResponse.json();
+                             displayError(errorData.detail || `Error fetching status (${statusResponse.status})`);
+                        }
+                        stopPolling();
+                        return;
+                    }
+                    
+                    const statusData = await statusResponse.json();
+                    updateUIBasedOnStatus(statusData);
+                    
+                    if (statusData.status === 'COMPLETED' || statusData.status === 'FAILED') {
+                        stopPolling();
+                        if (statusData.status === 'COMPLETED') {
+                            displayResults(statusData.result); 
+                            resultsDiv.style.display = 'block';
+                            followUpSection.style.display = 'block';
+                            resultsDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                        } else {
+                             displayError(statusData.error || 'Analysis job failed.');
+                        }
+                    }
+                    
+                } catch (error) {
+                    console.error('Error polling job status:', error);
+                    displayError('Could not get analysis status. Please check later or try again.');
+                    stopPolling();
+                }
+            }, POLLING_INTERVAL_MS);
+            
+            pollTimeoutId = setTimeout(() => {
+                console.warn('Polling timed out.');
+                if (pollingIntervalId) {
+                    displayError('Analysis is taking longer than expected. Please check back later.');
+                    stopPolling(); 
+                }
+            }, POLLING_TIMEOUT_MS);
+        }
+        
+        function stopPolling() {
+            if (pollingIntervalId) clearInterval(pollingIntervalId);
+            if (pollTimeoutId) clearTimeout(pollTimeoutId);
+            pollingIntervalId = null;
+            pollTimeoutId = null;
+        }
+        
+        function updateUIBasedOnStatus(statusData) {
+             switch (statusData.status) {
+                 case 'QUEUED':
+                     showStatusMessage(`Analysis queued (Job ID: ${statusData.job_id}). Waiting for processing...`);
+                     break;
+                 case 'PROCESSING':
+                     showStatusMessage(`Analysis in progress... (Job ID: ${statusData.job_id})`);
+                     break;
+                 case 'COMPLETED':
+                     showStatusMessage(`Analysis complete!`); 
+                     break;
+                 case 'FAILED':
+                      showStatusMessage(`Analysis failed.`);
+                     break;
+                 default:
+                      showStatusMessage(`Status: ${statusData.status || 'Unknown'}`);
+             }
         }
 
         async function handleQuestionSubmit(event) {
             event.preventDefault();
             
+            currentSessionId = getCookie('session_id'); 
             if (!currentSessionId) {
-                addMessageToChat('assistant', 'Error: Session not found. Please analyze a video first.', true);
+                addMessageToChat('assistant', 'Error: Session information missing. Please try analyzing a video again.', true);
                 return;
             }
             
@@ -1077,7 +1215,7 @@
             addMessageToChat('user', question);
             questionInput.value = '';
             const originalButtonText = askButton.querySelector('.button-text').textContent;
-            const originalButtonIcon = askButton.querySelector('.button-icon').innerHTML;
+            const originalButtonIcon = getOriginalIconHTML(askButton);
             showLoading(askButton, 'Thinking...');
             
             const loadingMessage = addMessageToChat('assistant', '<div class="typing-indicator"><span></span><span></span><span></span></div>');
@@ -1095,8 +1233,8 @@
                 });
                 
                 clearTimeout(timeoutId);
-                const result = await response.json();
                 if (loadingMessage) loadingMessage.remove();
+                const result = await response.json();
                 
                 if (!response.ok) {
                     throw new Error(result.error || `Server responded with status: ${response.status}`);
@@ -1114,21 +1252,14 @@
             }
         }
 
-        // --- Chat & Result Display --- 
         function addMessageToChat(role, content, isError = false) {
             const messageDiv = document.createElement('div');
             messageDiv.className = `chat-message ${role}-message`;
             if (isError) messageDiv.classList.add('error-message');
             
             const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            const avatarUser = `
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-                </svg>`;
-            const avatarAssistant = `
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                </svg>`;
+            const avatarUser = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>`;
+            const avatarAssistant = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" /></svg>`;
 
             if (role === 'user') {
                 messageDiv.innerHTML = `
@@ -1138,8 +1269,7 @@
                     </div>
                     <div class="message-avatar user">${avatarUser}</div>
                 `;
-            } else { // assistant
-                // Handle typing indicator separately
+            } else {
                 const messageText = content.includes('typing-indicator') ? content : escapeHtml(content);
                 messageDiv.innerHTML = `
                     <div class="message-avatar assistant">${avatarAssistant}</div>
@@ -1158,14 +1288,11 @@
         function displayResults(data) {
             let html = '';
 
-            // Handle errors first
-            if (data.error && data.raw_feedback) {
+            if (data && data.error && data.raw_feedback) {
                 html += `
                     <div class="error feedback-section">
                         <h3 class="error-title">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line>
-                            </svg>
+                           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
                             Analysis Error
                         </h3>
                         <p>${escapeHtml(data.error)}</p>
@@ -1174,21 +1301,18 @@
                             <pre style="margin-top: 0.5rem; background: var(--gray-100); padding: 0.75rem; border-radius: var(--radius-sm); font-size: 0.875rem; white-space: pre-wrap; word-break: break-all;">${escapeHtml(data.raw_feedback)}</pre>
                         </details>
                     </div>`;
-            } else if (data.error) {
-                html += `
+            } else if (data && data.error) {
+                 html += `
                     <div class="error feedback-section">
                         <h3 class="error-title">
-                             <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line>
-                            </svg>
+                             <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
                             Analysis Error
                         </h3>
                         <p>${escapeHtml(data.error)}</p>
                     </div>`;
             }
 
-            // Display overall feedback if no error or if partial data exists
-            if (data.feedback) {
+            if (data && data.feedback) {
                 html += `
                     <div class="feedback-section">
                         <h3 class="feedback-section-title">Overall Feedback</h3>
@@ -1198,8 +1322,7 @@
                     </div>`;
             }
 
-            // Display scores if available
-            if (data.scores && typeof data.scores === 'object' && Object.keys(data.scores).length > 0) {
+            if (data && data.scores && typeof data.scores === 'object' && Object.keys(data.scores).length > 0) {
                 html += `
                     <div class="feedback-section">
                         <h3 class="feedback-section-title">Detailed Scores</h3>
@@ -1207,96 +1330,46 @@
                 
                 for (const [key, value] of Object.entries(data.scores)) {
                     const score = Number(value);
-                    let badgeClass = '';
-                    let label = '';
-                    
-                    if (score <= 4) { badgeClass = 'badge-low'; label = 'Needs Work'; }
-                    else if (score <= 7) { badgeClass = 'badge-medium'; label = 'Good'; }
-                    else { badgeClass = 'badge-high'; label = 'Excellent'; }
-                    
+                    let badgeClass = '', label = '';
+                    if (score <= 4) { badgeClass = 'badge-low'; label = 'Needs Work'; } else if (score <= 7) { badgeClass = 'badge-medium'; label = 'Good'; } else { badgeClass = 'badge-high'; label = 'Excellent'; }
                     html += `
                         <div class="score-card">
-                            <div class="score-card-header">
-                                <div class="score-card-title">${escapeHtml(key)}</div>
-                                <div class="score-value ${badgeClass}">${score.toFixed(1)}</div>
-                            </div>
-                            <div class="score-bar">
-                                <div class="score-fill ${badgeClass}" style="width: ${score * 10}%;" data-score="${score * 10}"></div>
-                            </div>
-                            <div class="score-card-footer">
-                                <span class="badge ${badgeClass}">${label}</span>
-                            </div>
+                            <div class="score-card-header"><div class="score-card-title">${escapeHtml(key)}</div><div class="score-value ${badgeClass}">${score.toFixed(1)}</div></div>
+                            <div class="score-bar"><div class="score-fill ${badgeClass}" style="width: 0%;" data-score="${score * 10}"></div></div>
+                            <div class="score-card-footer"><span class="badge ${badgeClass}">${label}</span></div>
                         </div>`;
                 }
                 
-                // Display overall score if explicitly provided
                 if (data.overall_score !== undefined && data.overall_score !== null) {
                     const overallScore = Number(data.overall_score);
-                    let overallBadgeClass = '';
-                    let overallLabel = '';
-                    
-                    if (overallScore <= 4) { overallBadgeClass = 'badge-low'; overallLabel = 'Needs Work'; }
-                    else if (overallScore <= 7) { overallBadgeClass = 'badge-medium'; overallLabel = 'Good'; }
-                    else { overallBadgeClass = 'badge-high'; overallLabel = 'Excellent'; }
-                    
+                    let overallBadgeClass = '', overallLabel = '';
+                    if (overallScore <= 4) { overallBadgeClass = 'badge-low'; overallLabel = 'Needs Work'; } else if (overallScore <= 7) { overallBadgeClass = 'badge-medium'; overallLabel = 'Good'; } else { overallBadgeClass = 'badge-high'; overallLabel = 'Excellent'; }
                     html += `
                         <div class="score-card overall">
-                            <div class="score-card-header">
-                                <div class="score-card-title">OVERALL RATING</div>
-                                <div class="score-value ${overallBadgeClass}">${overallScore.toFixed(1)}</div>
-                            </div>
-                            <div class="score-bar">
-                                <div class="score-fill ${overallBadgeClass}" style="width: ${overallScore * 10}%;" data-score="${overallScore * 10}"></div>
-                            </div>
-                            <div class="score-card-footer">
-                                <span class="badge ${overallBadgeClass}">${overallLabel}</span>
-                            </div>
+                             <div class="score-card-header"><div class="score-card-title">OVERALL RATING</div><div class="score-value ${overallBadgeClass}">${overallScore.toFixed(1)}</div></div>
+                            <div class="score-bar"><div class="score-fill ${overallBadgeClass}" style="width: 0%;" data-score="${overallScore * 10}"></div></div>
+                            <div class="score-card-footer"><span class="badge ${overallBadgeClass}">${overallLabel}</span></div>
                         </div>`;
                 }
-                
-                html += `</div></div>`; // Close score-grid and feedback-section
-            }
-
-            // Display strengths
-            if (data.strengths && Array.isArray(data.strengths) && data.strengths.length > 0) {
-                html += `
-                    <div class="feedback-section">
-                        <h3 class="feedback-section-title">Strengths</h3>
-                        <div class="insights-list">`;
-                data.strengths.forEach(item => {
-                    html += `
-                        <div class="insight-item strength">
-                            <div class="insight-icon">${getIcon('strength')}</div>
-                            <div class="insight-content">${formatText(item)}</div>
-                        </div>`;
-                });
                 html += `</div></div>`;
             }
 
-            // Display improvement areas
-            if (data.improvement_areas && Array.isArray(data.improvement_areas) && data.improvement_areas.length > 0) {
-                html += `
-                    <div class="feedback-section">
-                        <h3 class="feedback-section-title">Areas for Improvement</h3>
-                        <div class="insights-list">`;
-                data.improvement_areas.forEach(item => {
-                    html += `
-                        <div class="insight-item improvement">
-                             <div class="insight-icon">${getIcon('improvement')}</div>
-                            <div class="insight-content">${formatText(item)}</div>
-                        </div>`;
-                });
+            if (data && data.strengths && Array.isArray(data.strengths) && data.strengths.length > 0) {
+                html += `<div class="feedback-section"><h3 class="feedback-section-title">Strengths</h3><div class="insights-list">`;
+                data.strengths.forEach(item => { html += `<div class="insight-item strength"><div class="insight-icon">${getIcon('strength')}</div><div class="insight-content">${formatText(item)}</div></div>`; });
                 html += `</div></div>`;
             }
 
-            // Fallback for unexpected data format when no error was explicitly reported
-            if (!html && !data.error) {
-                html = `
-                    <div class="error feedback-section">
-                        <h3 class="error-title">Unexpected Data Format</h3>
-                        <p>The analysis result was not in the expected format. See raw data below.</p>
-                        <pre style="margin-top: 0.75rem; background: var(--gray-100); padding: 0.75rem; border-radius: var(--radius-sm); font-size: 0.875rem; white-space: pre-wrap;">${JSON.stringify(data, null, 2)}</pre>
-                    </div>`;
+            if (data && data.improvement_areas && Array.isArray(data.improvement_areas) && data.improvement_areas.length > 0) {
+                html += `<div class="feedback-section"><h3 class="feedback-section-title">Areas for Improvement</h3><div class="insights-list">`;
+                data.improvement_areas.forEach(item => { html += `<div class="insight-item improvement"><div class="insight-icon">${getIcon('improvement')}</div><div class="insight-content">${formatText(item)}</div></div>`; });
+                html += `</div></div>`;
+            }
+
+            if (!html && (!data || !data.error)) {
+                 html = `<p>Could not display analysis results. Data might be missing or in an unexpected format.</p>`;
+                 rawResultPre.textContent = JSON.stringify(data, null, 2);
+                 rawResultPre.style.display = 'block';
             }
 
             resultContent.innerHTML = html;
@@ -1308,13 +1381,11 @@
                 const scoreFills = document.querySelectorAll('.score-fill');
                 scoreFills.forEach(fill => {
                     const targetWidth = fill.getAttribute('data-score') + '%';
-                    fill.style.width = '0%'; // Start from 0
-                    // Trigger reflow
+                    fill.style.width = '0%';
                     void fill.offsetWidth;
-                    // Animate to target width
                     fill.style.width = targetWidth;
                 });
-            }, 100); // Short delay to ensure elements are rendered
+            }, 100);
         }
         
         function getIcon(type) {
@@ -1331,7 +1402,6 @@
             return '';
         }
 
-        // --- Helper Functions ---
         function formatParagraphs(text) {
             if (!text) return '';
             return escapeHtml(text)
@@ -1343,16 +1413,16 @@
         
         function formatText(text) {
             if (!text) return '';
-            const parts = text.split(/\*\*(.*?)\*\*/g); // Split by bold markdown
+            const parts = text.split(/\*\*(.*?)\*\*/g);
             let formatted = '';
             for (let i = 0; i < parts.length; i++) {
-                if (i % 2 === 1) { // Odd indices are bolded content
+                if (i % 2 === 1) {
                     formatted += `<strong>${escapeHtml(parts[i])}</strong>`;
-                } else { // Even indices are regular text
+                } else {
                     formatted += escapeHtml(parts[i]);
                 }
             }
-             // Basic handling for list-like items if needed
+            
             if (formatted.trim().startsWith('-') || formatted.trim().startsWith('*')) {
                  formatted = `<span style="margin-left: 1em;">${formatted.trim().substring(1).trim()}</span>`;
              }
