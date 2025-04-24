@@ -1,6 +1,6 @@
 import os
 import google.generativeai as genai
-from fastapi import FastAPI, UploadFile, File, Request, Form, Depends, HTTPException, Header, Cookie, status
+from fastapi import FastAPI, UploadFile, File, Request, Form, Depends, HTTPException, Header, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -17,13 +17,6 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 from google.api_core import exceptions as google_exceptions
 import time
-from pydantic import BaseModel # For request body validation
-
-# --- Vercel Blob/KV Imports (Add these) ---
-from vercel_blob import put as vercel_put, BlobClient, ClientError, HEADERS as BLOB_HEADERS
-from vercel_kv import KVClient
-import requests
-# ----------------------------------------
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -47,15 +40,6 @@ SESSION_KEY_LAST_ACTIVE = "last_active"
 SESSION_KEY_ANALYSES = "video_analyses"
 SESSION_KEY_CONVERSATION = "conversation_history"
 SESSION_KEY_CURRENT_ANALYSIS_ID = "current_analysis_id"
-SESSION_KEY_JOB_ID = "job_id"
-SESSION_KEY_STATUS = "status"
-SESSION_KEY_BLOB_URL = "blob_url"
-SESSION_KEY_RESULT = "result"
-SESSION_KEY_ERROR = "error"
-JOB_STATUS_QUEUED = "QUEUED"
-JOB_STATUS_PROCESSING = "PROCESSING"
-JOB_STATUS_COMPLETED = "COMPLETED"
-JOB_STATUS_FAILED = "FAILED"
 
 if not API_KEY:
     logger.error("GEMINI_API_KEY not found in environment variables.")
@@ -371,340 +355,282 @@ def parse_gemini_response(response_text):
             "raw_feedback": response_text
         }
 
-# --- Vercel Blob Upload Token Endpoint ---
-class UploadTokenRequest(BaseModel):
-    filename: str
+@app.post("/analyze")
+async def analyze_video(
+    request: Request, 
+    video: UploadFile = File(...),
+    session_id: str = Depends(get_or_create_session)
+) -> Response:
+    """
+    Handles video upload, calls Gemini API for analysis, and returns feedback.
+    Uses session management to store results for later reference.
+    """
+    logger.info(f"Received video file: {video.filename}, content type: {video.content_type}")
 
-@app.post("/api/upload-token", status_code=status.HTTP_200_OK)
-async def create_upload_token(payload: UploadTokenRequest):
-    """Generate a client-side upload token for Vercel Blob."""
-    filename = payload.filename
-    if not filename:
-        raise HTTPException(status_code=400, detail="Filename is required.")
-
+    # --- File Size Check --- 
+    # Get file size. Need to read the file to know the size accurately with UploadFile.
+    # This reads the entire file into memory first, which might be an issue for *very* large files
+    # on memory-constrained systems. A streaming check would be more complex.
     try:
-        # Generate a token for client-side uploads
-        # 'pathname' determines the path within the blob store
-        # 'clientPayload' can be used to pass metadata (optional)
-        # 'allowedContentTypes' restricts upload types
-        # 'maximumSizeInBytes' restricts file size
-        token_response = BlobClient().create_client_upload_token(
-            pathname=f"uploads/{uuid.uuid4()}-{filename}", # Unique path
-            allowed_content_types=["video/mp4", "video/quicktime", "video/webm", "video/ogg"], # Adjust as needed
-            maximum_size_in_bytes=MAX_UPLOAD_SIZE_BYTES,
-            # Add access: 'public' if blobs should be publicly accessible by URL
-            # access='public', 
-        )
-        logger.info(f"Generated Vercel Blob upload token for: {filename}")
-        return token_response
-    except ClientError as e:
-        logger.error(f"Vercel Blob ClientError generating token: {e.status_code} - {e.body}")
-        raise HTTPException(status_code=500, detail=f"Could not get upload permission: {e.message}")
-    except Exception as e:
-        logger.exception("Unexpected error generating upload token")
-        raise HTTPException(status_code=500, detail="Server error generating upload token.")
-# --- End Vercel Blob Upload Token Endpoint ---
-
-# --- Analysis Start Endpoint (replaces old /analyze) ---
-class StartAnalysisRequest(BaseModel):
-    blob_url: str
-    filename: str
-    content_type: str
-
-@app.post("/api/start-analysis", status_code=status.HTTP_202_ACCEPTED)
-async def start_analysis_job(payload: StartAnalysisRequest, session_id: str = Depends(get_or_create_session)):
-    """Receives blob URL, queues analysis job in KV, returns job ID."""
-    blob_url = payload.blob_url
-    filename = payload.filename
-    content_type = payload.content_type
-    
-    logger.info(f"Received request to start analysis for blob: {blob_url} (Session: {session_id})")
-
-    if not kv_client:
-        raise HTTPException(status_code=500, detail="KV Store not configured. Cannot queue job.")
-    if not blob_url or not filename:
-        raise HTTPException(status_code=400, detail="Missing blob_url or filename.")
-
-    job_id = f"job_{uuid.uuid4()}"
-    job_data = {
-        SESSION_KEY_STATUS: JOB_STATUS_QUEUED,
-        SESSION_KEY_BLOB_URL: blob_url,
-        "filename": filename,
-        "content_type": content_type,
-        "session_id": session_id,
-        "queued_at": datetime.now().isoformat(),
-        SESSION_KEY_RESULT: None,
-        SESSION_KEY_ERROR: None,
-    }
-
-    try:
-        # Store job details in KV, set expiration (e.g., 24 hours)
-        kv_client.set(job_id, json.dumps(job_data), ex=SESSION_TIMEOUT_HOURS * 3600)
-        logger.info(f"Queued analysis job {job_id} for blob {blob_url}")
-        
-        # Optionally store job_id in user session if needed later
-        SESSION_STORE[session_id][SESSION_KEY_JOB_ID] = job_id 
-        
-        return {SESSION_KEY_JOB_ID: job_id, SESSION_KEY_STATUS: JOB_STATUS_QUEUED}
-    except Exception as e:
-        logger.exception(f"Failed to queue job {job_id} in Vercel KV")
-        raise HTTPException(status_code=500, detail="Failed to queue analysis job.")
-# --- End Analysis Start Endpoint ---
-
-# --- Analysis Status Endpoint ---
-@app.get("/api/analysis-status/{job_id}", status_code=status.HTTP_200_OK)
-async def get_analysis_status(job_id: str, session_id: str = Depends(get_or_create_session)):
-    """Checks the status and result of an analysis job from KV."""
-    logger.info(f"Checking status for job {job_id} (Session: {session_id})")
-    if not kv_client:
-        raise HTTPException(status_code=500, detail="KV Store not configured. Cannot check job status.")
-
-    try:
-        job_data_json = kv_client.get(job_id)
-        if not job_data_json:
-            logger.warning(f"Job {job_id} not found in KV.")
-            raise HTTPException(status_code=404, detail="Analysis job not found.")
-        
-        job_data = json.loads(job_data_json)
-        
-        # Basic check: ensure session requesting status matches job's session
-        if job_data.get("session_id") != session_id:
-             logger.warning(f"Session mismatch trying to access job {job_id}")
-             raise HTTPException(status_code=403, detail="Forbidden")
-
-        response_data = {
-            SESSION_KEY_JOB_ID: job_id,
-            SESSION_KEY_STATUS: job_data.get(SESSION_KEY_STATUS, "UNKNOWN"),
-            SESSION_KEY_RESULT: job_data.get(SESSION_KEY_RESULT),
-            SESSION_KEY_ERROR: job_data.get(SESSION_KEY_ERROR)
-        }
-        return response_data
-        
-    except json.JSONDecodeError:
-         logger.error(f"Failed to decode job data for {job_id} from KV.")
-         raise HTTPException(status_code=500, detail="Error retrieving job status.")
-    except Exception as e:
-        logger.exception(f"Failed to get status for job {job_id} from Vercel KV")
-        raise HTTPException(status_code=500, detail="Failed to retrieve job status.")
-# --- End Analysis Status Endpoint ---
-
-# --- Background Job Processor Endpoint (Triggered by Cron) ---
-@app.post("/api/process-jobs", status_code=status.HTTP_200_OK)
-async def process_queued_jobs(request: Request, x_vercel_cron_secret: Optional[str] = Header(None)):
-    """Picks up QUEUED jobs from KV and processes them."""
-    # --- Security Check (Important!) ---
-    # Ensure this endpoint is secured, e.g., using a Vercel Cron secret
-    expected_secret = os.getenv("VERCEL_CRON_SECRET")
-    if not expected_secret or x_vercel_cron_secret != expected_secret:
-        logger.warning("Unauthorized attempt to access /api/process-jobs")
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    # --------------------------------
-
-    logger.info("Cron job triggered: Processing queued analysis jobs...")
-    if not kv_client:
-        logger.error("KV client not available. Cannot process jobs.")
-        return {"message": "KV client not available"}
-
-    processed_count = 0
-    failed_count = 0
-    try:
-        # Find queued jobs (Requires iterating keys - potentially slow for large KV stores)
-        # WARNING: KV scan can be slow. Better patterns exist for large scale (e.g., separate queue list).
-        queued_job_ids = []
-        cursor = 0
-        while True:
-            cursor, keys = kv_client.scan(cursor=cursor, match="job_*")
-            for key in keys:
-                try:
-                    job_data_json = kv_client.get(key)
-                    if job_data_json:
-                        job_data = json.loads(job_data_json)
-                        if job_data.get(SESSION_KEY_STATUS) == JOB_STATUS_QUEUED:
-                            queued_job_ids.append(key)
-                except Exception:
-                    logger.warning(f"Failed to check status for key {key} during scan", exc_info=True)
-            if cursor == 0:
-                break
-        
-        logger.info(f"Found {len(queued_job_ids)} queued jobs.")
-
-        # Process one job per invocation (typical for serverless cron)
-        if queued_job_ids:
-            job_id_to_process = queued_job_ids[0] # Simple FIFO
-            logger.info(f"Processing job: {job_id_to_process}")
-            try:
-                 # Mark as processing
-                 job_data_json = kv_client.get(job_id_to_process)
-                 if not job_data_json:
-                      logger.warning(f"Job {job_id_to_process} disappeared before processing.")
-                      return {"message": f"Job {job_id_to_process} not found"}
-                 
-                 job_data = json.loads(job_data_json)
-                 job_data[SESSION_KEY_STATUS] = JOB_STATUS_PROCESSING
-                 job_data["processing_started_at"] = datetime.now().isoformat()
-                 kv_client.set(job_id_to_process, json.dumps(job_data), ex=SESSION_TIMEOUT_HOURS * 3600) # Update TTL
-                 
-                 # Perform the actual analysis
-                 analysis_result = await perform_analysis(job_data)
-                 
-                 # Update job status with result or error
-                 job_data[SESSION_KEY_STATUS] = JOB_STATUS_COMPLETED if "error" not in analysis_result else JOB_STATUS_FAILED
-                 if "error" in analysis_result:
-                     job_data[SESSION_KEY_ERROR] = analysis_result["error"]
-                     job_data[SESSION_KEY_RESULT] = analysis_result.get("raw_feedback") # Store raw if error
-                     failed_count += 1
-                 else:
-                     job_data[SESSION_KEY_RESULT] = analysis_result
-                     processed_count += 1
-                 
-                 job_data["completed_at"] = datetime.now().isoformat()
-                 kv_client.set(job_id_to_process, json.dumps(job_data), ex=SESSION_TIMEOUT_HOURS * 3600)
-                 logger.info(f"Finished processing job {job_id_to_process}. Status: {job_data[SESSION_KEY_STATUS]}")
-
-            except Exception as e:
-                logger.exception(f"Failed processing job {job_id_to_process}")
-                failed_count += 1
-                try:
-                    # Try to mark the job as failed in KV
-                    job_data[SESSION_KEY_STATUS] = JOB_STATUS_FAILED
-                    job_data[SESSION_KEY_ERROR] = f"Processing error: {str(e)}"
-                    job_data["completed_at"] = datetime.now().isoformat()
-                    kv_client.set(job_id_to_process, json.dumps(job_data), ex=SESSION_TIMEOUT_HOURS * 3600)
-                except Exception as kv_err:
-                     logger.error(f"Failed to update job {job_id_to_process} status to FAILED in KV: {kv_err}")
-        else:
-            logger.info("No queued jobs found to process.")
-
-    except Exception as e:
-        logger.exception("Error during job processing loop")
-        return {"message": f"Error scanning/processing jobs: {str(e)}"}
-        
-    return {"message": f"Job processing finished. Processed: {processed_count}, Failed: {failed_count}"}
-
-# --- Analysis Logic (Refactored for Background Task) ---
-async def perform_analysis(job_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Downloads video, runs Gemini analysis, returns result/error dict."""
-    blob_url = job_data.get(SESSION_KEY_BLOB_URL)
-    filename = job_data.get("filename", "unknown_video")
-    content_type = job_data.get("content_type", "video/mp4") # Default if missing
-    job_id = job_data.get(SESSION_KEY_JOB_ID, "unknown_job")
-
-    logger.info(f"Starting analysis for job {job_id}, blob: {blob_url}")
-
-    # Download video from Blob URL
-    temp_file_path = None
-    google_file = None
-    try:
-        response = requests.get(blob_url, stream=True)
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix) as temp_file:
-            for chunk in response.iter_content(chunk_size=8192):
-                temp_file.write(chunk)
-            temp_file_path = temp_file.name
-        logger.info(f"Job {job_id}: Video downloaded temporarily to {temp_file_path}")
-
-        # --- Existing Gemini Analysis Logic (Adapted) ---
-        if not API_KEY:
-            return {"error": "API key not configured on server."}
-        
-        model = genai.GenerativeModel(MODEL_NAME)
-        prompt = create_analysis_prompt()
-        
-        # Upload to Google AI
-        logger.info(f"Job {job_id}: Uploading {temp_file_path} to Google AI...")
-        google_file = genai.upload_file(
-            path=temp_file_path,
-            mime_type=content_type,
-            display_name=filename
-        )
-        if not google_file:
-             raise Exception("Google AI file upload returned None.")
-        logger.info(f"Job {job_id}: Uploaded to Google AI. File Name: {google_file.name}")
-
-        # Wait for Google file processing
-        processing_start_time = time.time()
-        while True:
-            if time.time() - processing_start_time > GEMINI_FILE_PROCESSING_TIMEOUT_SECONDS:
-                 raise TimeoutError("Google AI file processing timed out.")
-            file_state = genai.get_file(google_file.name)
-            state_value = file_state.state
-            logger.info(f"Job {job_id}: Checking Google file state {google_file.name}: {state_value}")
-            if state_value == 1: break
-            if state_value == 2: raise Exception("Google AI file processing failed.")
-            await asyncio.sleep(GEMINI_FILE_POLL_INTERVAL_SECONDS)
-        
-        # Short delay before use
-        await asyncio.sleep(GEMINI_FILE_RETRY_DELAY_SECONDS)
-        
-        # Call Gemini (with retry for 'not ACTIVE' error)
-        analysis_result = {}
-        try:
-            logger.info(f"Job {job_id}: Calling Gemini API (Attempt 1)...")
-            generation_config = { "temperature": 0.2, "top_p": 0.95, "top_k": 64, "max_output_tokens": 8192 }
-            safety_settings = [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"}
-            ]
-            response = model.generate_content(
-                [prompt, google_file],
-                generation_config=generation_config,
-                safety_settings=safety_settings,
-                request_options={"timeout": GEMINI_REQUEST_TIMEOUT_SECONDS},
-                stream=False
+        # Seek to the end to get the size, then back to the start
+        video.file.seek(0, os.SEEK_END)
+        file_size = video.file.tell()
+        video.file.seek(0)
+        logger.info(f"Reported file size: {file_size} bytes")
+        if file_size > MAX_UPLOAD_SIZE_BYTES:
+            logger.warning(f"Upload failed: File size {file_size} exceeds limit of {MAX_UPLOAD_SIZE_BYTES} bytes.")
+            return JSONResponse(
+                status_code=413, # Payload Too Large
+                content={"error": f"Video file is too large ({round(file_size / (1024*1024), 1)} MB). Maximum size is {MAX_UPLOAD_SIZE_MB} MB."}
             )
-        except google_exceptions.FailedPrecondition as e:
-            if "not in an ACTIVE state" in str(e):
-                logger.warning(f"Job {job_id}: Gemini reported file not ACTIVE (Attempt 1). Retrying...")
-                await asyncio.sleep(GEMINI_FILE_RETRY_DELAY_SECONDS)
-                logger.info(f"Job {job_id}: Calling Gemini API (Attempt 2)...")
-                response = model.generate_content([prompt, google_file], generation_config=generation_config, safety_settings=safety_settings, request_options={"timeout": GEMINI_REQUEST_TIMEOUT_SECONDS}, stream=False)
-            else:
-                raise
-        
-        logger.info(f"Job {job_id}: Received Gemini response.")
-        if not response.candidates:
-             block_reason = getattr(response, 'prompt_feedback', {}).get('block_reason', 'Unknown')
-             raise Exception(f"AI analysis response empty/blocked (Reason: {block_reason}).")
-        
-        analysis_result = parse_gemini_response(response.text)
-        # --- End Gemini Logic --- 
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Job {job_id}: Failed to download video from Blob URL {blob_url}: {e}")
-        return {"error": f"Failed to download video: {str(e)}"}
-    except (google_exceptions.GoogleAPICallError, google_exceptions.RetryError, google_exceptions.FailedPrecondition) as e:
-        logger.error(f"Job {job_id}: Google API error during analysis: {e}")
-        return {"error": f"Google API error: {str(e)}"}
     except Exception as e:
-        logger.exception(f"Job {job_id}: Unexpected error during analysis of {blob_url}")
-        return {"error": f"Unexpected analysis error: {str(e)}"}
-    finally:
-        # Clean up temporary file
-        if temp_file_path and Path(temp_file_path).exists():
-            try:
-                os.unlink(temp_file_path)
-                logger.info(f"Job {job_id}: Cleaned up temp file {temp_file_path}")
-            except Exception as cleanup_err:
-                logger.warning(f"Job {job_id}: Failed to clean up temp file {temp_file_path}: {cleanup_err}")
-        # Clean up Google AI file
-        if google_file:
-             try:
-                 logger.info(f"Job {job_id}: Attempting to delete Google AI file: {google_file.name}")
-                 # genai.delete_file(google_file.name) # Use when available
-                 logger.info("Note: Google AI file deletion via SDK might not be fully supported yet.")
-             except Exception as cleanup_err:
-                 logger.warning(f"Job {job_id}: Failed to delete Google AI file {google_file.name}: {cleanup_err}")
+        # If seeking fails, it might be a stream that doesn't support it.
+        # Log a warning but proceed cautiously. A more robust solution might be needed.
+        logger.warning(f"Could not determine file size before reading: {e}. Proceeding with upload attempt.")
+        # Optionally, you could enforce a content-length header check here if available
+    # --- End File Size Check ---
+
+    if not video.content_type or not video.content_type.startswith('video/'): # Added check for None content_type
+        logger.warning(f"Uploaded file is not a video or content type is missing: {video.content_type}")
+        return JSONResponse(status_code=400, content={"error": "Uploaded file must be a video."})
+
+    if not API_KEY:
+        return JSONResponse(status_code=500, content={"error": "API key not configured. Please check server setup."})
+
+    # Save the uploaded file temporarily
+    try:
+        # Create a temporary file to store the video
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(video.filename).suffix) as temp_file:
+            # Read the uploaded file in chunks to handle large files
+            chunk_size = 1024 * 1024  # 1MB chunks
+            while chunk := await video.read(chunk_size):
+                temp_file.write(chunk)
+            
+            temp_file_path = temp_file.name
+            logger.info(f"Video saved temporarily at {temp_file_path}")
+        
+        # Initialize the model
+        try:
+            model = genai.GenerativeModel(MODEL_NAME)
+            logger.info(f"Model {MODEL_NAME} initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Gemini model: {e}")
+            return JSONResponse(
+                status_code=500, 
+                content={"error": f"Failed to initialize AI model: {str(e)}"}
+            )
+
+        # Create the prompt
+        prompt = create_analysis_prompt()
+        # logger.info("Created analysis prompt") # Less verbose logging
+
+        # Upload the file to Google AI
+        google_file = None # Initialize google_file
+        try:
+            # Ensure temp_file_path exists before proceeding
+            if not Path(temp_file_path).is_file():
+                 raise FileNotFoundError(f"Temporary video file not found at {temp_file_path}")
+            
+            # Upload the video to Google's servers using the file path
+            logger.info(f"Uploading video file from path: {temp_file_path}")
+            google_file = genai.upload_file(
+                path=temp_file_path, 
+                mime_type=video.content_type,
+                display_name=video.filename # Add display name
+            )
+            
+            if not google_file:
+                 raise Exception("Google AI file upload returned None.")
                  
-    return analysis_result
-# --- End Analysis Logic ---
+            logger.info(f"Video uploaded successfully. File Name: {google_file.name}") # Use google_file.name
+            
+            # Call the model with the prompt and video
+            try:
+                # Define generation and safety settings before the API call attempts
+                generation_config = {
+                    "temperature": 0.2,  # Lower temperature for more focused/precise responses
+                    "top_p": 0.95,
+                    "top_k": 64,
+                    "max_output_tokens": 8192, # Increased max output tokens
+                }
+                
+                safety_settings = [
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"}
+                ]
+                
+                # --- Wait for file to become ACTIVE ---
+                processing_timeout_seconds = GEMINI_FILE_PROCESSING_TIMEOUT_SECONDS
+                start_time = time.time()
+                while True:
+                    # Check file state
+                    state = google_file.state
+                    if state == 1:  # 1 means ACTIVE
+                        break
+                    elif state == 2:  # 2 means FAILED
+                        error_msg = f"Google AI file upload failed with state: {state}"
+                        logger.error(error_msg)
+                        raise google_exceptions.FailedPrecondition(error_msg)
+                    elif time.time() - start_time > processing_timeout_seconds:
+                        error_msg = f"Google AI file upload timed out after {processing_timeout_seconds} seconds"
+                        logger.error(error_msg)
+                        raise google_exceptions.FailedPrecondition(error_msg)
+                    # If state is not 1 (ACTIVE) or 2 (FAILED), keep waiting
+                    await asyncio.sleep(GEMINI_FILE_POLL_INTERVAL_SECONDS)
+                # ----------------------------------------
+                
+                # Add a small delay AFTER confirming ACTIVE state to mitigate potential race condition
+                logger.info("Adding short delay before using the file...")
+                await asyncio.sleep(GEMINI_FILE_RETRY_DELAY_SECONDS)
 
-# Remove the old synchronous /analyze endpoint
-# @app.post("/analyze") ... (Delete this old function)
+                logger.info("Calling Gemini API for video analysis (Attempt 1)...")
+                try:
+                    response = model.generate_content(
+                        [prompt, google_file],
+                        generation_config=generation_config,
+                        safety_settings=safety_settings,
+                        request_options={"timeout": GEMINI_REQUEST_TIMEOUT_SECONDS}, 
+                        stream=False,
+                    )
+                except google_exceptions.FailedPrecondition as e:
+                    # Specific check for the "not ACTIVE" error
+                    if "not in an ACTIVE state" in str(e):
+                        logger.warning(f"Gemini API reported file not ACTIVE on first attempt: {e}. Retrying after delay...")
+                        await asyncio.sleep(5) # Wait 5 more seconds before retrying
+                        logger.info("Calling Gemini API for video analysis (Attempt 2)...")
+                        response = model.generate_content(
+                            [prompt, google_file],
+                            generation_config=generation_config,
+                            safety_settings=safety_settings,
+                            request_options={"timeout": GEMINI_REQUEST_TIMEOUT_SECONDS}, 
+                            stream=False,
+                        )
+                    else:
+                        raise # Re-raise if it's a different FailedPrecondition error
+                
+                logger.info("Received response from Gemini API")
 
-# Update /ask endpoint to use new session keys
+                # Check for blocked prompts or empty candidates
+                if not response.candidates:
+                     logger.warning("Gemini response has no candidates. Possible safety block or empty response.")
+                     # Try to get block reason if available
+                     block_reason = getattr(response, 'prompt_feedback', {}).get('block_reason', 'Unknown reason')
+                     error_msg = f"AI analysis failed. The response was empty or blocked (Reason: {block_reason})."
+                     raise google_exceptions.FailedPrecondition(error_msg)
+                     
+                response_text = response.text # Access text after checking candidates
+                
+                # Try to parse the response as JSON
+                try:
+                    # Clean potential markdown code fences
+                    if response_text.strip().startswith("```") and response_text.strip().endswith("```"):
+                        response_text = response_text.strip()[3:-3].strip() # Remove fences
+                        # Remove potential language identifier (e.g., json)
+                        if response_text.startswith("json\n"):
+                             response_text = response_text[5:].strip()
+                             
+                    # Parse the JSON response
+                    analysis_result = parse_gemini_response(response_text)
+                    logger.info("Successfully parsed JSON response")
+                    
+                    # Store the analysis in the session
+                    analysis_entry = {
+                        "timestamp": datetime.now().isoformat(),
+                        "video_name": video.filename,
+                        "analysis_id": str(uuid.uuid4()),
+                        "result": analysis_result
+                    }
+                    SESSION_STORE[session_id]["video_analyses"].append(analysis_entry)
+                    SESSION_STORE[session_id]["current_analysis_id"] = analysis_entry["analysis_id"]
+                    SESSION_STORE[session_id]["conversation_history"] = [
+                        {"role": "system", "content": "You are an AI speaking coach who has just analyzed a video. The user may ask follow-up questions about the analysis. Be helpful and specific in your answers."},
+                        {"role": "user", "content": "I've uploaded a video of my speaking for analysis."},
+                        {"role": "assistant", "content": f"I've analyzed your speaking performance. Here's my feedback: {json.dumps(analysis_result)}"}
+                    ]
+                    
+                    # Add the session_id to the response for the client to store
+                    analysis_result["session_id"] = session_id
+                    analysis_result["analysis_id"] = analysis_entry["analysis_id"]
+                    
+                except (json.JSONDecodeError, ValueError) as json_err:
+                    logger.error(f"Failed to parse AI response as JSON: {json_err}")
+                    logger.debug(f"Raw AI response: {response.text}") # Log raw text on error
+                    # Return the raw text with an error indicator
+                    analysis_result = {
+                        "error": "Failed to parse AI response as JSON.",
+                        "raw_feedback": response.text, # Keep raw text separate
+                        "scores": {},
+                        "overall_score": 0,
+                        "strengths": [],
+                        "improvement_areas": ["Could not parse the AI response into the expected format."]
+                    }
+                    # Still save this partial result to session
+                    analysis_entry = {
+                        "timestamp": datetime.now().isoformat(),
+                        "video_name": video.filename,
+                        "analysis_id": str(uuid.uuid4()),
+                        "result": analysis_result
+                    }
+                    SESSION_STORE[session_id]["video_analyses"].append(analysis_entry)
+                    SESSION_STORE[session_id]["current_analysis_id"] = analysis_entry["analysis_id"]
+                    SESSION_STORE[session_id]["conversation_history"] = [
+                         {"role": "system", "content": "You are an AI speaking coach. Analysis failed to parse correctly."},
+                         {"role": "assistant", "content": f"I tried analyzing the video, but had trouble formatting the response. Here is the raw feedback: {response.text}"}
+                     ]
+                    analysis_result["session_id"] = session_id
+                    analysis_result["analysis_id"] = analysis_entry["analysis_id"]
+
+            except (google_exceptions.GoogleAPICallError, google_exceptions.RetryError, google_exceptions.FailedPrecondition) as api_err:
+                logger.error(f"Error calling Gemini API: {api_err}")
+                return JSONResponse(
+                    status_code=500, 
+                    content={"error": f"Error during AI analysis: {str(api_err)}"}
+                )
+            except Exception as e:
+                 logger.exception("Unexpected error during Gemini API call") # Log full traceback
+                 return JSONResponse(status_code=500, content={"error": "An unexpected error occurred during AI analysis."})
+            finally:
+                # Clean up the uploaded file on Google's side
+                if google_file:
+                    try:
+                        logger.info(f"Attempting to delete Google AI file: {google_file.name}")
+                        # genai.delete_file(google_file.name) # Use delete_file when available
+                        # As of June 2024, direct deletion might still be unavailable/unreliable via SDK
+                        # Files generally expire automatically after ~48 hours
+                        logger.info("Note: Google AI file deletion via SDK might not be fully supported yet. Files typically expire automatically.")
+                    except Exception as cleanup_err:
+                        logger.warning(f"Failed to delete Google AI uploaded file ({google_file.name}): {cleanup_err}")
+
+        except Exception as upload_err:
+            logger.error(f"Failed to upload or process video for Google AI: {upload_err}")
+            return JSONResponse(
+                status_code=500, 
+                content={"error": f"Failed to prepare video for analysis: {str(upload_err)}"}
+            )
+
+    except Exception as e:
+        logger.exception(f"Unexpected error processing video upload for {video.filename}")
+        return JSONResponse(
+            status_code=500, 
+            content={"error": f"An unexpected server error occurred while processing the video."}
+        )
+    finally:
+        # Clean up the temporary file
+        try:
+            if 'temp_file_path' in locals():
+                os.unlink(temp_file_path)
+                logger.info(f"Temporary file {temp_file_path} deleted")
+        except Exception as cleanup_err:
+            logger.warning(f"Failed to clean up temporary file: {cleanup_err}")
+
+    logger.info(f"Returning analysis for {video.filename}")
+    # Add Set-Cookie header to store the session ID
+    response = JSONResponse(content=analysis_result)
+    response.set_cookie(key="session_id", value=session_id, max_age=int(timedelta(hours=SESSION_TIMEOUT_HOURS).total_seconds()))
+    return response
+
 @app.post("/ask")
 async def ask_followup_question(
     request: Request,
@@ -715,14 +641,13 @@ async def ask_followup_question(
     Handles follow-up questions about a previous video analysis.
     Uses the conversation history stored in the session.
     """
-    logger.info(f"Received follow-up question for session {session_id}: '{question}'")
+    logger.info(f"Received follow-up question: {question}")
     
-    # Check if this session has any analysis and conversation history
-    if session_id not in SESSION_STORE or not SESSION_STORE[session_id].get(SESSION_KEY_CONVERSATION):
-        logger.warning(f"No conversation history found for session {session_id}. Cannot process follow-up.")
+    # Check if this session has any analysis
+    if session_id not in SESSION_STORE or not SESSION_STORE[session_id].get("video_analyses"):
         return JSONResponse(
             status_code=400,
-            content={"error": "No previous analysis found in this session to ask about. Please upload a video first."}
+            content={"error": "No video analysis found in this session. Please upload a video first."}
         )
     
     try:
@@ -730,67 +655,56 @@ async def ask_followup_question(
         model = genai.GenerativeModel(MODEL_NAME)
         
         # Get conversation history
-        conversation_history = SESSION_STORE[session_id][SESSION_KEY_CONVERSATION]
+        conversation = SESSION_STORE[session_id]["conversation_history"]
         
         # Add the new question
-        conversation_history.append({"role": "user", "content": question})
+        conversation.append({"role": "user", "content": question})
+        
+        # Create a formatted conversation for the model
+        formatted_conversation = "\n\n".join([
+            f"{msg['role'].upper()}: {msg['content']}" 
+            for msg in conversation
+        ])
         
         # Call the model to get a response to the follow-up question
-        generation_config = { "temperature": 0.5, "top_p": 0.95, "top_k": 64, "max_output_tokens": 1024 }
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"}
-        ]
-
-        logger.info("Calling Gemini API for follow-up question...")
+        generation_config = {
+            "temperature": 0.2,
+            "top_p": 0.95,
+            "top_k": 64,
+            "max_output_tokens": 1024,
+        }
+        
         response = model.generate_content(
-            conversation_history,
+            formatted_conversation,
             generation_config=generation_config,
-            safety_settings=safety_settings,
             stream=False
         )
-        logger.info("Received response from Gemini API for follow-up.")
-
-        if not response.candidates:
-             logger.warning("Follow-up response has no candidates.")
-             block_reason = getattr(response, 'prompt_feedback', {}).get('block_reason', 'Unknown')
-             error_msg = f"AI could not answer the question (Reason: {block_reason})."
-             raise google_exceptions.FailedPrecondition(error_msg)
-
-        response_text = response.text
         
-        conversation_history.append({"role": "assistant", "content": response_text})
-        SESSION_STORE[session_id][SESSION_KEY_CONVERSATION] = conversation_history # Update session
+        # Add the response to conversation history
+        conversation.append({"role": "assistant", "content": response.text})
+        SESSION_STORE[session_id]["conversation_history"] = conversation
         
-        return JSONResponse(content={"response": response_text})
+        # Return the response
+        return JSONResponse(content={"response": response.text})
         
-    except (google_exceptions.GoogleAPICallError, google_exceptions.RetryError, google_exceptions.FailedPrecondition) as api_err:
-        logger.error(f"Error calling Gemini API for follow-up: {api_err}")
-        return JSONResponse(status_code=500, content={"error": f"Error getting response from AI: {str(api_err)}"})
     except Exception as e:
-        logger.exception("Error processing follow-up question")
-        return JSONResponse(status_code=500, content={"error": f"An unexpected error occurred while processing your question."})
+        logger.exception("Error processing follow-up question") # Log full traceback
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"An unexpected error occurred while processing your question."}
+        )
 
-# Health check endpoint (remains the same)
+# Add a simple health check endpoint (optional but good practice)
 @app.get("/health", response_model=Dict[str, str])
 async def health_check():
     return {"status": "ok"}
 
-# Main execution block (remains the same)
 if __name__ == "__main__":
+    import uvicorn
     # Check if API key is loaded before running
     if not API_KEY:
         print("ERROR: GEMINI_API_KEY not set. Please create a .env file with your key.")
         print("Example .env file content:")
         print("GEMINI_API_KEY=YOUR_API_KEY_HERE")
     else:
-        # Initialize Vercel KV client
-        try:
-            kv_client = KVClient()
-            logger.info("Vercel KV client initialized.")
-        except Exception as e:
-            logger.error(f"Failed to initialize Vercel KV client: {e}. KV features will be disabled.")
-            kv_client = None
         uvicorn.run(app, host="0.0.0.0", port=8000) 
